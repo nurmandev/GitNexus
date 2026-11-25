@@ -1242,6 +1242,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
         method,
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.65,
       });
     }
@@ -1264,6 +1265,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
         method,
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.65,
       });
     }
@@ -1283,6 +1285,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: httpMethod,
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.65,
       });
     }
