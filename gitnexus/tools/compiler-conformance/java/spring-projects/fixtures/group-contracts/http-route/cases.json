@@ -2046,6 +2046,24 @@
           "extractionStrategy": "source_scan",
           "framework": "java-http-client"
         }
+      },
+      {
+        "contractId": "http::GET::/api/webclient-not-hc",
+        "type": "http",
+        "role": "consumer",
+        "symbolUid": "",
+        "symbolRef": {
+          "filePath": "src/CtorOverride.java",
+          "name": "fetch"
+        },
+        "symbolName": "fetch",
+        "confidence": 0.7,
+        "meta": {
+          "method": "GET",
+          "path": "/api/webclient-not-hc",
+          "extractionStrategy": "source_scan",
+          "framework": "spring-web-client"
+        }
       }
     ]
   },

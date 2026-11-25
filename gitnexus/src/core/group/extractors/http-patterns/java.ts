@@ -42,6 +42,8 @@ import {
 } from '../../../ingestion/route-extractors/java-const-resolver.js';
 import {
   extractStaticPathExpression,
+  extractWebClientUriBuilderLambdaPath,
+  extractOkHttpUrlExpression,
   inferOkHttpMethod,
   inferHttpClientMethod,
   okHttpUrlRootsAtBuilder,
@@ -50,6 +52,9 @@ import {
   collectJavaHttpClientReceivers,
   isRestTemplateReceiver,
   isWebClientReceiver,
+  resolveWebClientReceiverBaseUrl,
+  joinWebClientBaseAndPath,
+  collectScopeUriVars,
 } from './java-static-path.js';
 import type { HttpDetection, HttpLanguagePlugin, HttpProjectScan } from './types.js';
 
@@ -361,17 +366,13 @@ const JAVA_HTTP_CLIENT_PATTERNS = compilePatterns({
       query: `
         (method_invocation
           name: (identifier) @uri_method (#eq? @uri_method "uri")
-          arguments: (argument_list
-            (method_invocation
-              object: (identifier) @uriCls (#eq? @uriCls "URI")
-              name: (identifier) @create (#eq? @create "create")
-              arguments: (argument_list . (_) @path)))) @call
+          arguments: (argument_list . (_) @path)) @call
       `,
     },
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
-// Constructor-arg form: `HttpRequest.newBuilder(URI.create(...))` — the path is
+// Constructor-arg form: `HttpRequest.newBuilder(uriExpr)` — the path is
 // the `newBuilder(...)` argument, with no `.uri()` call. Captures the `newBuilder`
 // call as `@call`; the emission skips it when a later `.uri(...)` overrides the
 // constructor URI (`httpClientChainHasUriCall`), so the `.uri()` query owns that case.
@@ -385,11 +386,7 @@ const JAVA_HTTP_CLIENT_CTOR_PATTERNS = compilePatterns({
         (method_invocation
           object: (identifier) @builderCls (#eq? @builderCls "HttpRequest")
           name: (identifier) @newBuilder (#eq? @newBuilder "newBuilder")
-          arguments: (argument_list
-            (method_invocation
-              object: (identifier) @uriCls (#eq? @uriCls "URI")
-              name: (identifier) @create (#eq? @create "create")
-              arguments: (argument_list . (_) @path)))) @call
+          arguments: (argument_list . (_) @path)) @call
       `,
     },
   ],
@@ -1066,23 +1063,77 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       return consumerFoldConstants;
     };
 
+    interface ResolveConsumerOptions {
+      allowStaticBuilder?: boolean;
+      allowLambda?: boolean;
+      allowHttpUrl?: boolean;
+    }
+
+    const scopeVarsCache = new Map<number, Map<string, string>>();
+    const findEnclosingScope = (node: Parser.SyntaxNode): Parser.SyntaxNode => {
+      let cur: Parser.SyntaxNode | null = node.parent;
+      while (cur) {
+        if (
+          cur.type === 'method_declaration' ||
+          cur.type === 'constructor_declaration' ||
+          cur.type === 'class_declaration'
+        ) {
+          return cur;
+        }
+        cur = cur.parent;
+      }
+      return tree.rootNode;
+    };
+
+    const getScopeVars = (node: Parser.SyntaxNode, depth: number): Map<string, string> => {
+      if (depth > 8) return new Map();
+      const scope = findEnclosingScope(node);
+      const cached = scopeVarsCache.get(scope.id);
+      if (cached) return cached;
+      // Put placeholder first to prevent cyclic recursion across self-referential vars.
+      const empty = new Map<string, string>();
+      scopeVarsCache.set(scope.id, empty);
+      let clsVars: Map<string, string> | undefined;
+      if (scope.type !== 'class_declaration') {
+        const cls = findEnclosingClass(scope);
+        if (cls) {
+          clsVars = getScopeVars(cls.namedChildren[0] ?? cls, depth + 1);
+        }
+      }
+      const computed = collectScopeUriVars(
+        scope,
+        (initNode) =>
+          resolveConstOrConcat(
+            initNode,
+            { allowStaticBuilder: true, allowHttpUrl: true },
+            depth + 1,
+          ),
+        clsVars,
+      );
+      scopeVarsCache.set(scope.id, computed);
+      return computed;
+    };
+
     const resolveConstOrConcat = (
       pathNode: Parser.SyntaxNode,
-      allowStaticBuilder = false,
+      opts: ResolveConsumerOptions = {},
+      depth = 0,
     ): string | null => {
+      if (depth > 16) return null;
       if (pathNode.type === 'string_literal') return unquoteLiteral(pathNode.text);
-      if (allowStaticBuilder) {
-        const staticPath = extractStaticPathExpression(pathNode);
+      const argResolver = (arg: Parser.SyntaxNode): string | null =>
+        resolveConstOrConcat(arg, opts, depth + 1);
+      if (opts.allowLambda) {
+        const lambdaPath = extractWebClientUriBuilderLambdaPath(pathNode, argResolver);
+        if (lambdaPath !== null) return lambdaPath;
+      }
+      if (opts.allowHttpUrl) {
+        const httpUrlPath = extractOkHttpUrlExpression(pathNode, argResolver);
+        if (httpUrlPath !== null) return httpUrlPath;
+      }
+      if (opts.allowStaticBuilder) {
+        const staticPath = extractStaticPathExpression(pathNode, argResolver);
         if (staticPath !== null) return staticPath;
-        // Unwrap `URI.create(expr)` when the inner argument is a constant or concat expression.
-        if (
-          pathNode.type === 'method_invocation' &&
-          pathNode.childForFieldName('object')?.text === 'URI' &&
-          pathNode.childForFieldName('name')?.text === 'create'
-        ) {
-          const inner = pathNode.childForFieldName('arguments')?.namedChildren[0];
-          if (inner) return resolveConstOrConcat(inner, false);
-        }
       }
       const constants = getConsumerFoldConstants();
       if (constants) {
@@ -1091,6 +1142,11 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
           const folded = foldJavaOperands(effectiveFileRel, operands, constants);
           if (folded !== null) return folded;
         }
+      }
+      if (pathNode.type === 'identifier') {
+        const scoped = getScopeVars(pathNode, depth).get(pathNode.text);
+        if (scoped !== undefined) return scoped;
+        return null;
       }
       if (pathNode.type !== 'binary_expression') return null;
       const parts: Array<{ literal: string } | { dynamic: true }> = [];
@@ -1123,6 +1179,11 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
             }
           }
           if (node.type === 'identifier') {
+            const scoped = getScopeVars(node, depth).get(node.text);
+            if (scoped !== undefined) {
+              parts.push({ literal: scoped });
+              return true;
+            }
             parts.push({ dynamic: true });
             return true;
           }
@@ -1259,7 +1320,9 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     }
 
     // ─── Consumers: RestTemplate & WebClient (type-aware receivers) ─
-    const receivers = collectJavaHttpClientReceivers(tree);
+    const resolveBaseUrlArg = (arg: Parser.SyntaxNode): string | null =>
+      resolveConstOrConcat(arg, { allowStaticBuilder: true });
+    const receivers = collectJavaHttpClientReceivers(tree, resolveBaseUrlArg);
 
     for (const match of runCompiledPatterns(REST_TEMPLATE_PATTERNS, tree)) {
       const objNode = match.captures.obj;
@@ -1269,7 +1332,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isRestTemplateReceiver(objNode, receivers)) continue;
       const httpMethod = REST_TEMPLATE_TO_HTTP[methodNode.text];
       if (!httpMethod) continue;
-      const path = resolveConstOrConcat(pathNode, true);
+      const path = resolveConstOrConcat(pathNode, { allowStaticBuilder: true });
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1288,7 +1351,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!httpMethodNode || !pathNode) continue;
       if (!isRestTemplateReceiver(objNode, receivers)) continue;
-      const path = resolveConstOrConcat(pathNode, true);
+      const path = resolveConstOrConcat(pathNode, { allowStaticBuilder: true });
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1312,8 +1375,13 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isWebClientReceiver(objNode, receivers)) continue;
       const httpMethod = WEB_CLIENT_SHORT_TO_HTTP[verbNode.text];
       if (!httpMethod) continue;
-      const path = resolveConstOrConcat(pathNode);
-      if (path === null) continue;
+      const rawPath = resolveConstOrConcat(pathNode, {
+        allowStaticBuilder: true,
+        allowLambda: true,
+      });
+      if (rawPath === null) continue;
+      const baseUrl = resolveWebClientReceiverBaseUrl(objNode, receivers, resolveBaseUrlArg);
+      const path = joinWebClientBaseAndPath(baseUrl, rawPath);
       out.push({
         role: 'consumer',
         framework: 'spring-web-client',
@@ -1338,8 +1406,13 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isWebClientReceiver(objNode, receivers)) continue;
       const verbText = verbNode.text;
       if (!WEB_CLIENT_LONG_VERB_RE.test(verbText)) continue;
-      const path = resolveConstOrConcat(pathNode);
-      if (path === null) continue;
+      const rawPath = resolveConstOrConcat(pathNode, {
+        allowStaticBuilder: true,
+        allowLambda: true,
+      });
+      if (rawPath === null) continue;
+      const baseUrl = resolveWebClientReceiverBaseUrl(objNode, receivers, resolveBaseUrlArg);
+      const path = joinWebClientBaseAndPath(baseUrl, rawPath);
       out.push({
         role: 'consumer',
         framework: 'spring-web-client',
@@ -1353,14 +1426,17 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
 
     // ─── Consumers: OkHttp Request.Builder().url("path") ────────────
     // Match any `.url(...)`, gate to chains rooting at `new Request.Builder()`
-    // (so a call before `.url()` is captured but an unrelated `.url()` is not), then
-    // recover the verb (`.post()`/`.method("X")`) by scanning the builder chain.
+    // or a tracked `Request.Builder` variable, then recover the verb
+    // (`.post()`/`.method("X")`) by scanning the builder chain.
     for (const match of runCompiledPatterns(OK_HTTP_PATTERNS, tree)) {
       const callNode = match.captures.call;
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
-      if (!okHttpUrlRootsAtBuilder(callNode)) continue;
-      const path = resolveConstOrConcat(pathNode);
+      if (!okHttpUrlRootsAtBuilder(callNode, receivers.okHttpBuilderNames)) continue;
+      const path = resolveConstOrConcat(pathNode, {
+        allowStaticBuilder: true,
+        allowHttpUrl: true,
+      });
       if (path === null) continue;
       const method = inferOkHttpMethod(callNode);
       // An explicit `.method(verb, …)` with a non-literal or empty verb is
@@ -1379,19 +1455,20 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     }
 
     // ─── Consumers: Java HttpClient request builder ─────────────────
-    // Match any `.uri(URI.create(...))`, gate to chains including `HttpRequest`
+    // Match any `.uri(uriExpr)`, gate to chains including `HttpRequest`
     // `.newBuilder()` (so a call before `.uri()` is captured but an unrelated
     // `.uri()` is not); `inferHttpClientMethod` scans the chain for the verb — a
     // `.GET()/.POST()/.PUT()/.DELETE()/.HEAD()` helper, a `.method("VERB", body)`
     // literal, or the bare-build default GET. A variable-bound `.method(verb, …)`
     // is unresolvable → emit nothing. Mirrors the OkHttp loop above. The
-    // constructor-arg form (`newBuilder(URI.create(...))`, no `.uri()`) follows.
+    // constructor-arg form (`newBuilder(uriExpr)`, no `.uri()`) follows.
     for (const match of runCompiledPatterns(JAVA_HTTP_CLIENT_PATTERNS, tree)) {
       const callNode = match.captures.call;
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
       if (!httpClientUriRootsAtNewBuilder(callNode)) continue;
-      const path = resolveConstOrConcat(pathNode);
+      if (pathNode.type === 'string_literal') continue;
+      const path = resolveConstOrConcat(pathNode, { allowStaticBuilder: true });
       if (path === null) continue;
       const method = inferHttpClientMethod(callNode);
       if (!method) continue;
@@ -1406,7 +1483,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       });
     }
 
-    // Constructor-arg form: `HttpRequest.newBuilder(URI.create(...))` with the
+    // Constructor-arg form: `HttpRequest.newBuilder(uriExpr)` with the
     // path in the constructor and no overriding `.uri(...)` later in the chain
     // (a later `.uri()` wins at runtime, so the loop above owns that case).
     for (const match of runCompiledPatterns(JAVA_HTTP_CLIENT_CTOR_PATTERNS, tree)) {
@@ -1414,7 +1491,8 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
       if (httpClientChainHasUriCall(callNode)) continue;
-      const path = resolveConstOrConcat(pathNode);
+      if (pathNode.type === 'string_literal') continue;
+      const path = resolveConstOrConcat(pathNode, { allowStaticBuilder: true });
       if (path === null) continue;
       const method = inferHttpClientMethod(callNode);
       if (!method) continue;
@@ -1436,7 +1514,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!typeNode || !pathNode) continue;
       const httpMethod = APACHE_HTTP_CLIENT_TO_HTTP[typeNode.text];
       if (!httpMethod) continue;
-      const path = resolveConstOrConcat(pathNode);
+      const path = resolveConstOrConcat(pathNode, { allowStaticBuilder: true });
       if (path === null) continue;
       out.push({
         role: 'consumer',

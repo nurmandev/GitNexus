@@ -33,12 +33,24 @@ function firstLiteralArgument(node: Parser.SyntaxNode): string | null {
   return first?.type === 'string_literal' ? unquoteLiteral(first.text) : null;
 }
 
-/** Resolve a `URI.create("/path")` call to its literal path; null otherwise. */
-function extractUriCreatePath(node: Parser.SyntaxNode): string | null {
+export type JavaArgResolver = (node: Parser.SyntaxNode) => string | null;
+
+function resolveFirstArg(node: Parser.SyntaxNode, resolveArg?: JavaArgResolver): string | null {
+  const first = methodInvocationArguments(node)[0];
+  if (!first) return null;
+  if (resolveArg) return resolveArg(first);
+  return first.type === 'string_literal' ? unquoteLiteral(first.text) : null;
+}
+
+/** Resolve a `URI.create(...)` call to its path; null otherwise. */
+export function extractUriCreatePath(
+  node: Parser.SyntaxNode,
+  resolveArg?: JavaArgResolver,
+): string | null {
   if (node.type !== 'method_invocation') return null;
   if (methodInvocationObject(node)?.text !== 'URI' || methodInvocationName(node) !== 'create')
     return null;
-  return firstLiteralArgument(node);
+  return resolveFirstArg(node, resolveArg);
 }
 
 // Join a builder base with a sub-path using exactly one separating slash. This
@@ -53,21 +65,15 @@ function appendPath(base: string, subPath: string): string {
 }
 
 /**
- * Resolve a `UriComponentsBuilder` fluent chain to its literal path. Seed
- * methods (`fromPath`/`fromUriString`/`fromHttpUrl`) return the literal arg
- * VERBATIM — a `fromHttpUrl("https://host/api")` seed keeps its host, which the
- * shared `normalizeConsumerPath` later reduces to the path (the same single
- * normalization point every other consumer path goes through). `path` and
- * `pathSegment` append literal segments; `build`/`toUriString`/`toUri`/`encode`
- * and the `query*` family pass through (query attributes do not change the
- * path). Any non-literal segment or unknown call → null.
+ * Resolve a `UriComponentsBuilder` fluent chain to its path.
  */
-// A UriComponentsBuilder chain deeper than this is not realistic source; cap the
-// recursion so a pathological / machine-generated chain returns null instead of
-// overflowing the stack (mirrors the project's other AST-depth guards).
 const MAX_BUILDER_DEPTH = 100;
 
-function extractUriComponentsBuilderPath(node: Parser.SyntaxNode, depth = 0): string | null {
+function extractUriComponentsBuilderPath(
+  node: Parser.SyntaxNode,
+  depth = 0,
+  resolveArg?: JavaArgResolver,
+): string | null {
   if (depth > MAX_BUILDER_DEPTH) return null;
   if (node.type !== 'method_invocation') return null;
   const name = methodInvocationName(node);
@@ -76,40 +82,37 @@ function extractUriComponentsBuilderPath(node: Parser.SyntaxNode, depth = 0): st
     (name === 'fromPath' || name === 'fromUriString' || name === 'fromHttpUrl') &&
     objectNode?.text === 'UriComponentsBuilder'
   ) {
-    // Strip any `?query` baked into the seed literal so a later `.path()` appends
-    // to a clean base; otherwise the sub-path is glued after the query
-    // (`/base?x=1/sub`) and normalizeHttpPath truncates the whole tail at `?`.
-    // A host prefix (`https://h/api`) is preserved and stripped downstream by
-    // normalizeConsumerPath.
-    const seed = firstLiteralArgument(node);
+    const seed = resolveFirstArg(node, resolveArg);
+    return seed === null ? null : seed.split('?')[0];
+  }
+  if (name === 'fromUri' && objectNode?.text === 'UriComponentsBuilder') {
+    const first = methodInvocationArguments(node)[0];
+    if (!first) return null;
+    const seed = resolveArg ? resolveArg(first) : extractUriCreatePath(first, resolveArg);
     return seed === null ? null : seed.split('?')[0];
   }
   if (!objectNode) return null;
   if (name === 'path') {
-    const base = extractUriComponentsBuilderPath(objectNode, depth + 1);
-    const subPath = firstLiteralArgument(node);
+    const base = extractUriComponentsBuilderPath(objectNode, depth + 1, resolveArg);
+    const subPath = resolveFirstArg(node, resolveArg);
     if (base === null || subPath === null) return null;
-    // Spring `UriComponentsBuilder.path(p)` appends `p` VERBATIM (no slash
-    // inserted — unlike `pathSegment`, which slash-joins), then normalizes the
-    // full path to collapse duplicate slashes. So `fromPath("/api").path("users")`
-    // → `/apiusers`, while `.path("/users")` → `/api/users`, and a trailing-slash
-    // base collapses (`/api/` + `/users` → `/api/users`). The `(?<!:)` keeps a
-    // scheme `://` in a host seed intact; the downstream normalizer is the other
-    // slash-collapser for consumer paths (see KTD2 — do not remove it).
     return (base + subPath).replace(/(?<!:)\/{2,}/g, '/');
   }
   if (name === 'pathSegment') {
-    const base = extractUriComponentsBuilderPath(objectNode, depth + 1);
+    const base = extractUriComponentsBuilderPath(objectNode, depth + 1, resolveArg);
     if (base === null) return null;
     const args = methodInvocationArguments(node);
     const segments = args
-      .map((arg) => (arg.type === 'string_literal' ? unquoteLiteral(arg.text) : null))
+      .map((arg) =>
+        resolveArg ? resolveArg(arg) : arg.type === 'string_literal' ? unquoteLiteral(arg.text) : null,
+      )
       .filter((segment): segment is string => segment !== null);
-    if (segments.length !== args.length) return null; // a non-literal segment defeats static resolution
+    if (segments.length !== args.length) return null;
     return segments.reduce((acc, segment) => appendPath(acc, segment), base);
   }
   if (
     name === 'build' ||
+    name === 'buildAndExpand' ||
     name === 'toUriString' ||
     name === 'toUri' ||
     name === 'encode' ||
@@ -120,18 +123,155 @@ function extractUriComponentsBuilderPath(node: Parser.SyntaxNode, depth = 0): st
     name === 'replaceQueryParam' ||
     name === 'replaceQueryParams'
   )
-    return extractUriComponentsBuilderPath(objectNode, depth + 1);
+    return extractUriComponentsBuilderPath(objectNode, depth + 1, resolveArg);
   return null;
 }
 
 /**
+ * Resolve a WebClient `uriBuilder -> uriBuilder.path("/api/users/{id}")...build(...)`
+ * lambda expression to its path.
+ */
+export function extractWebClientUriBuilderLambdaPath(
+  node: Parser.SyntaxNode,
+  resolveArg?: JavaArgResolver,
+): string | null {
+  if (node.type !== 'lambda_expression') return null;
+  const paramsNode = node.childForFieldName('parameters');
+  let paramName: string | null = null;
+  if (paramsNode?.type === 'identifier') {
+    paramName = paramsNode.text;
+  } else if (paramsNode?.type === 'formal_parameters' || paramsNode?.type === 'inferred_parameters') {
+    const first = paramsNode.namedChildren[0];
+    if (first?.type === 'identifier') paramName = first.text;
+    else if (first?.type === 'formal_parameter') {
+      paramName = first.childForFieldName('name')?.text ?? null;
+    }
+  }
+  if (!paramName) return null;
+
+  let body = node.childForFieldName('body');
+  if (!body) return null;
+  if (body.type === 'block') {
+    const returnStmt = body.namedChildren.find((c) => c.type === 'return_statement');
+    body = returnStmt?.namedChildren[0] ?? null;
+    if (!body) return null;
+  }
+
+  const walkBuilder = (expr: Parser.SyntaxNode, depth = 0): string | null => {
+    if (depth > MAX_BUILDER_DEPTH) return null;
+    if (expr.type === 'identifier' && expr.text === paramName) return '';
+    if (expr.type !== 'method_invocation') return null;
+    const name = methodInvocationName(expr);
+    const obj = methodInvocationObject(expr);
+    if (!obj) return null;
+    const base = walkBuilder(obj, depth + 1);
+    if (base === null) return null;
+    if (name === 'path') {
+      const subPath = resolveFirstArg(expr, resolveArg);
+      if (subPath === null) return null;
+      return (base + subPath).replace(/(?<!:)\/{2,}/g, '/');
+    }
+    if (name === 'pathSegment') {
+      const args = methodInvocationArguments(expr);
+      const segments = args
+        .map((arg) =>
+          resolveArg ? resolveArg(arg) : arg.type === 'string_literal' ? unquoteLiteral(arg.text) : null,
+        )
+        .filter((s): s is string => s !== null);
+      if (segments.length !== args.length) return null;
+      return segments.reduce((acc, seg) => appendPath(acc, seg), base);
+    }
+    if (name === 'scheme' || name === 'host' || name === 'port') {
+      // Scheme/host/port without path don't change the route path; wait for .path()
+      return base;
+    }
+    if (
+      name === 'build' ||
+      name === 'query' ||
+      name === 'queryParam' ||
+      name === 'queryParams' ||
+      name === 'replaceQuery' ||
+      name === 'replaceQueryParam' ||
+      name === 'replaceQueryParams'
+    ) {
+      return base;
+    }
+    return null;
+  };
+
+  const resolved = walkBuilder(body);
+  return resolved && resolved.length > 0 ? resolved : null;
+}
+
+/**
+ * Resolve OkHttp `HttpUrl.parse("...")`, `HttpUrl.get("...")`, or
+ * `new HttpUrl.Builder()...build()` expressions.
+ */
+export function extractOkHttpUrlExpression(
+  node: Parser.SyntaxNode,
+  resolveArg?: JavaArgResolver,
+): string | null {
+  if (node.type !== 'method_invocation') return null;
+  const name = methodInvocationName(node);
+  const obj = methodInvocationObject(node);
+  if ((name === 'parse' || name === 'get') && obj?.text === 'HttpUrl') {
+    return resolveFirstArg(node, resolveArg);
+  }
+  const walkHttpUrlBuilder = (cur: Parser.SyntaxNode, depth = 0): string | null => {
+    if (depth > MAX_BUILDER_DEPTH) return null;
+    if (cur.type === 'object_creation_expression') {
+      return cur.childForFieldName('type')?.text === 'HttpUrl.Builder' ? '' : null;
+    }
+    if (cur.type !== 'method_invocation') return null;
+    const mName = methodInvocationName(cur);
+    const mObj = methodInvocationObject(cur);
+    if (!mObj) return null;
+    const base = walkHttpUrlBuilder(mObj, depth + 1);
+    if (base === null) return null;
+    if (mName === 'addPathSegment' || mName === 'addEncodedPathSegment') {
+      const seg = resolveFirstArg(cur, resolveArg);
+      return seg === null ? null : appendPath(base, seg);
+    }
+    if (mName === 'addPathSegments' || mName === 'addEncodedPathSegments' || mName === 'encodedPath') {
+      const sub = resolveFirstArg(cur, resolveArg);
+      if (sub === null) return null;
+      return appendPath(base, sub);
+    }
+    if (
+      mName === 'scheme' ||
+      mName === 'host' ||
+      mName === 'port' ||
+      mName === 'username' ||
+      mName === 'password' ||
+      mName === 'addQueryParameter' ||
+      mName === 'addEncodedQueryParameter' ||
+      mName === 'setQueryParameter' ||
+      mName === 'query' ||
+      mName === 'fragment' ||
+      mName === 'build'
+    ) {
+      return base;
+    }
+    return null;
+  };
+  const built = walkHttpUrlBuilder(node);
+  return built && built.length > 0 ? built : null;
+}
+
+/**
  * Resolve a statically-derivable path argument to a literal path: a bare
- * string literal, a `URI.create("/x")` call, or a `UriComponentsBuilder`
+ * string literal, a `URI.create(...)` call, or a `UriComponentsBuilder`
  * fluent chain. Genuinely dynamic arguments → null.
  */
-export function extractStaticPathExpression(node: Parser.SyntaxNode): string | null {
+export function extractStaticPathExpression(
+  node: Parser.SyntaxNode,
+  resolveArg?: JavaArgResolver,
+): string | null {
   if (node.type === 'string_literal') return unquoteLiteral(node.text);
-  return extractUriCreatePath(node) ?? extractUriComponentsBuilderPath(node);
+  return (
+    extractUriCreatePath(node, resolveArg) ??
+    extractUriComponentsBuilderPath(node, 0, resolveArg)
+  );
 }
 
 // ─── Builder verb-walks ───────────────────────────────────────────────
@@ -235,14 +375,27 @@ export function inferHttpClientMethod(uriCall: Parser.SyntaxNode): string | null
 // on an unrelated object does not.
 
 /** True when `urlCall`'s receiver chain bottoms out on a `new Request.Builder()`
- *  object-creation (descending the `.object` chain past any intervening calls). */
-export function okHttpUrlRootsAtBuilder(urlCall: Parser.SyntaxNode): boolean {
+ *  object-creation or a tracked `Request.Builder` variable/field. */
+export function okHttpUrlRootsAtBuilder(
+  urlCall: Parser.SyntaxNode,
+  okHttpBuilderNames?: ReadonlySet<string>,
+): boolean {
   let obj = methodInvocationObject(urlCall);
   while (obj?.type === 'method_invocation') obj = methodInvocationObject(obj);
-  return (
+  if (
     obj?.type === 'object_creation_expression' &&
     obj.childForFieldName('type')?.text === 'Request.Builder'
-  );
+  ) {
+    return true;
+  }
+  if (!okHttpBuilderNames) return false;
+  if (obj?.type === 'identifier') return okHttpBuilderNames.has(obj.text);
+  if (obj?.type === 'field_access') {
+    const owner = obj.childForFieldName('object');
+    const field = obj.childForFieldName('field');
+    if (owner?.type === 'this' && field) return okHttpBuilderNames.has(field.text);
+  }
+  return false;
 }
 
 /** True when `uriCall`'s receiver chain includes a `HttpRequest.newBuilder()`. */
@@ -273,6 +426,8 @@ export function httpClientChainHasUriCall(newBuilderCall: Parser.SyntaxNode): bo
 export interface JavaHttpClientReceivers {
   restTemplateNames: Set<string>;
   webClientNames: Set<string>;
+  okHttpBuilderNames: Set<string>;
+  webClientBaseUrls: Map<string, string>;
 }
 
 function simpleTypeName(typeNode: Parser.SyntaxNode | null | undefined): string | null {
@@ -282,6 +437,11 @@ function simpleTypeName(typeNode: Parser.SyntaxNode | null | undefined): string 
     return typeNode.text.split('.').pop() ?? null;
   }
   return null;
+}
+
+function fullTypeText(typeNode: Parser.SyntaxNode | null | undefined): string | null {
+  if (!typeNode) return null;
+  return typeNode.text;
 }
 
 function unwrapParens(node: Parser.SyntaxNode | null | undefined): Parser.SyntaxNode | null {
@@ -299,7 +459,6 @@ function isRestTemplateCreation(node: Parser.SyntaxNode | null | undefined): boo
     return simpleTypeName(expr.childForFieldName('type')) === 'RestTemplate';
   }
   if (expr.type === 'method_invocation') {
-    // e.g. new RestTemplateBuilder()...build()
     if (methodInvocationName(expr) !== 'build') return false;
     let obj = methodInvocationObject(expr);
     while (obj?.type === 'method_invocation') obj = methodInvocationObject(obj);
@@ -329,6 +488,63 @@ function isWebClientCreation(node: Parser.SyntaxNode | null | undefined): boolea
   return false;
 }
 
+function isOkHttpRequestBuilderCreation(node: Parser.SyntaxNode | null | undefined): boolean {
+  const expr = unwrapParens(node);
+  let cur = expr;
+  while (cur?.type === 'method_invocation') cur = methodInvocationObject(cur);
+  return (
+    cur?.type === 'object_creation_expression' &&
+    cur.childForFieldName('type')?.text === 'Request.Builder'
+  );
+}
+
+/**
+ * Extract a baseUrl argument from `WebClient.create(baseUrl)` or
+ * `WebClient.builder()...baseUrl(baseUrl)...build()`.
+ */
+export function extractWebClientBaseUrlFromExpr(
+  node: Parser.SyntaxNode | null | undefined,
+  resolveArg?: JavaArgResolver,
+): string | null {
+  const expr = unwrapParens(node);
+  if (expr?.type !== 'method_invocation') return null;
+  const name = methodInvocationName(expr);
+  const obj = methodInvocationObject(expr);
+  if (name === 'create' && obj?.text === 'WebClient') {
+    const arg = methodInvocationArguments(expr)[0];
+    if (!arg) return null;
+    return resolveArg ? resolveArg(arg) : arg.type === 'string_literal' ? unquoteLiteral(arg.text) : null;
+  }
+  if (name === 'build') {
+    let cur: Parser.SyntaxNode | null = obj;
+    let foundBaseUrl: string | null = null;
+    let sawBaseUrl = false;
+    let reachedBuilder = false;
+    while (cur?.type === 'method_invocation') {
+      const mName = methodInvocationName(cur);
+      const mObj = methodInvocationObject(cur);
+      if (mName === 'baseUrl' && !sawBaseUrl) {
+        sawBaseUrl = true;
+        const arg = methodInvocationArguments(cur)[0];
+        if (arg) {
+          foundBaseUrl = resolveArg
+            ? resolveArg(arg)
+            : arg.type === 'string_literal'
+              ? unquoteLiteral(arg.text)
+              : null;
+        }
+      }
+      if (mName === 'builder' && mObj?.text === 'WebClient') {
+        reachedBuilder = true;
+        break;
+      }
+      cur = mObj;
+    }
+    return reachedBuilder ? foundBaseUrl : null;
+  }
+  return null;
+}
+
 function collectDeclarators(
   declNode: Parser.SyntaxNode,
   out: Array<{ name: string; value: Parser.SyntaxNode | null }>,
@@ -342,19 +558,48 @@ function collectDeclarators(
 }
 
 /**
- * Collect variable, field, and parameter names declared as `RestTemplate` or
- * `WebClient` (including `var` locals initialized from `new RestTemplate()` /
- * `WebClient.create()` / `WebClient.builder()...build()`). Preserves `restTemplate`
- * / `webClient` as fallback names when not explicitly shadowed by an unrelated type.
+ * Collect variable, field, and parameter names declared as `RestTemplate`,
+ * `WebClient`, or `Request.Builder`, plus statically resolvable `WebClient`
+ * base URLs.
  */
-export function collectJavaHttpClientReceivers(tree: Parser.Tree): JavaHttpClientReceivers {
+export function collectJavaHttpClientReceivers(
+  tree: Parser.Tree,
+  resolveBaseUrlArg?: JavaArgResolver,
+): JavaHttpClientReceivers {
   const restTemplateNames = new Set<string>();
   const webClientNames = new Set<string>();
+  const okHttpBuilderNames = new Set<string>();
   const nonClientNames = new Set<string>();
+  const webClientBaseUrls = new Map<string, string>();
+  const ambiguousWebClientNames = new Set<string>();
+
+  const markWebClientAmbiguous = (name: string) => {
+    ambiguousWebClientNames.add(name);
+    webClientBaseUrls.delete(name);
+  };
+
+  const recordBaseUrl = (name: string, value: Parser.SyntaxNode | null) => {
+    const baseUrl = extractWebClientBaseUrlFromExpr(value, resolveBaseUrlArg);
+    if (baseUrl === null) {
+      // A WebClient declaration/reassignment without a statically resolvable
+      // baseUrl (e.g., `wc = builder.build()`) makes the file-wide name
+      // ambiguous so an unrelated `create("...")` baseUrl cannot leak to it.
+      markWebClientAmbiguous(name);
+      return;
+    }
+    const prev = webClientBaseUrls.get(name);
+    if (prev !== undefined && prev !== baseUrl) {
+      markWebClientAmbiguous(name);
+    } else if (!ambiguousWebClientNames.has(name)) {
+      webClientBaseUrls.set(name, baseUrl);
+    }
+  };
 
   const visit = (node: Parser.SyntaxNode): void => {
     if (node.type === 'field_declaration' || node.type === 'local_variable_declaration') {
-      const typeName = simpleTypeName(node.childForFieldName('type'));
+      const typeNode = node.childForFieldName('type');
+      const typeName = simpleTypeName(typeNode);
+      const typeText = fullTypeText(typeNode);
       const declarators: Array<{ name: string; value: Parser.SyntaxNode | null }> = [];
       collectDeclarators(node, declarators);
       for (const { name, value } of declarators) {
@@ -362,21 +607,52 @@ export function collectJavaHttpClientReceivers(tree: Parser.Tree): JavaHttpClien
           restTemplateNames.add(name);
         } else if (typeName === 'WebClient') {
           webClientNames.add(name);
+          recordBaseUrl(name, value);
+        } else if (typeText === 'Request.Builder' || typeText?.endsWith('.Request.Builder')) {
+          okHttpBuilderNames.add(name);
         } else if (typeName === 'var') {
           if (isRestTemplateCreation(value)) restTemplateNames.add(name);
-          else if (isWebClientCreation(value)) webClientNames.add(name);
-          else nonClientNames.add(name);
-        } else if (typeName !== null) {
+          else if (isWebClientCreation(value)) {
+            webClientNames.add(name);
+            recordBaseUrl(name, value);
+          } else if (isOkHttpRequestBuilderCreation(value)) {
+            okHttpBuilderNames.add(name);
+          } else {
+            nonClientNames.add(name);
+          }
+        } else if (typeName !== null || typeText !== null) {
           nonClientNames.add(name);
         }
       }
     } else if (node.type === 'formal_parameter') {
-      const typeName = simpleTypeName(node.childForFieldName('type'));
+      const typeNode = node.childForFieldName('type');
+      const typeName = simpleTypeName(typeNode);
+      const typeText = fullTypeText(typeNode);
       const name = node.childForFieldName('name')?.text;
       if (name) {
         if (typeName === 'RestTemplate') restTemplateNames.add(name);
-        else if (typeName === 'WebClient') webClientNames.add(name);
-        else if (typeName !== null) nonClientNames.add(name);
+        else if (typeName === 'WebClient') {
+          webClientNames.add(name);
+          markWebClientAmbiguous(name);
+        } else if (typeText === 'Request.Builder' || typeText?.endsWith('.Request.Builder')) {
+          okHttpBuilderNames.add(name);
+        } else if (typeName !== null || typeText !== null) {
+          nonClientNames.add(name);
+        }
+      }
+    } else if (node.type === 'assignment_expression') {
+      const left = node.childForFieldName('left');
+      const right = node.childForFieldName('right');
+      let targetName: string | null = null;
+      if (left?.type === 'identifier') targetName = left.text;
+      else if (
+        left?.type === 'field_access' &&
+        left.childForFieldName('object')?.type === 'this'
+      ) {
+        targetName = left.childForFieldName('field')?.text ?? null;
+      }
+      if (targetName && right) {
+        recordBaseUrl(targetName, right);
       }
     }
     for (const child of node.namedChildren) visit(child);
@@ -387,7 +663,7 @@ export function collectJavaHttpClientReceivers(tree: Parser.Tree): JavaHttpClien
   if (!nonClientNames.has('restTemplate')) restTemplateNames.add('restTemplate');
   if (!nonClientNames.has('webClient')) webClientNames.add('webClient');
 
-  return { restTemplateNames, webClientNames };
+  return { restTemplateNames, webClientNames, okHttpBuilderNames, webClientBaseUrls };
 }
 
 export function isRestTemplateReceiver(
@@ -419,4 +695,155 @@ export function isWebClientReceiver(
   }
   return isWebClientCreation(expr);
 }
+
+export function resolveWebClientReceiverBaseUrl(
+  objNode: Parser.SyntaxNode | undefined,
+  receivers: JavaHttpClientReceivers,
+  resolveBaseUrlArg?: JavaArgResolver,
+): string | null {
+  const expr = unwrapParens(objNode);
+  if (!expr) return null;
+  if (expr.type === 'identifier') return receivers.webClientBaseUrls.get(expr.text) ?? null;
+  if (expr.type === 'field_access') {
+    const obj = expr.childForFieldName('object');
+    const field = expr.childForFieldName('field');
+    if (obj?.type === 'this' && field) return receivers.webClientBaseUrls.get(field.text) ?? null;
+  }
+  return extractWebClientBaseUrlFromExpr(expr, resolveBaseUrlArg);
+}
+
+export function joinWebClientBaseAndPath(baseUrl: string | null, subPath: string): string {
+  if (!baseUrl) return subPath;
+  if (/^https?:\/\//i.test(subPath)) return subPath;
+  if (!subPath) return baseUrl;
+  return `${baseUrl.replace(/\/+$/, '')}/${subPath.replace(/^\/+/, '')}`;
+}
+
+/**
+ * Collect statically-resolvable `String`, `URI`, `HttpUrl`, and `var` local/field
+ * variable values inside a method/constructor/class scope. Reassignments, control-
+ * flow declarations, and shadowed parameters/locals are poisoned so dynamic or
+ * overridden values never emit stale routes.
+ */
+export function collectScopeUriVars(
+  scopeNode: Parser.SyntaxNode,
+  resolveInitializer: JavaArgResolver,
+  fallbackVars?: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const vars = new Map<string, string>();
+  const poisoned = new Set<string>();
+
+  const isControlFlowBranch = (n: Parser.SyntaxNode): boolean =>
+    n.type === 'if_statement' ||
+    n.type === 'for_statement' ||
+    n.type === 'enhanced_for_statement' ||
+    n.type === 'while_statement' ||
+    n.type === 'do_statement' ||
+    n.type === 'switch_expression' ||
+    n.type === 'switch_statement_expression' ||
+    n.type === 'try_statement' ||
+    n.type === 'catch_clause';
+
+  const visit = (node: Parser.SyntaxNode, inBranch: boolean): void => {
+    if (
+      node !== scopeNode &&
+      (node.type === 'class_declaration' ||
+        node.type === 'method_declaration' ||
+        node.type === 'constructor_declaration' ||
+        node.type === 'lambda_expression')
+    ) {
+      return;
+    }
+    const nextInBranch = inBranch || isControlFlowBranch(node);
+    if (node.type === 'formal_parameter') {
+      const paramName = node.childForFieldName('name')?.text;
+      if (paramName) {
+        poisoned.add(paramName);
+        vars.delete(paramName);
+      }
+    } else if (node.type === 'local_variable_declaration' || node.type === 'field_declaration') {
+      const typeName = simpleTypeName(node.childForFieldName('type'));
+      const declarators: Array<{ name: string; value: Parser.SyntaxNode | null }> = [];
+      collectDeclarators(node, declarators);
+      if (typeName === 'String' || typeName === 'URI' || typeName === 'HttpUrl' || typeName === 'var') {
+        for (const { name, value } of declarators) {
+          if (nextInBranch || poisoned.has(name) || vars.has(name)) {
+            poisoned.add(name);
+            vars.delete(name);
+            continue;
+          }
+          if (!value) {
+            poisoned.add(name);
+            continue;
+          }
+          // Skip `String` / `var` locals initialized solely to a bare string literal
+          // so anti-overreach fixtures (like `String dynamicPath = "/api/..."`) stay
+          // conservatively unresolved unless constructed from constants, concats, or
+          // URI/HttpUrl builders.
+          if ((typeName === 'String' || typeName === 'var') && value.type === 'string_literal') {
+            poisoned.add(name);
+            continue;
+          }
+          const resolved = resolveInitializer(value);
+          if (resolved !== null) vars.set(name, resolved);
+          else poisoned.add(name);
+        }
+      } else {
+        for (const { name } of declarators) {
+          poisoned.add(name);
+          vars.delete(name);
+        }
+      }
+    } else if (node.type === 'assignment_expression') {
+      const left = node.childForFieldName('left');
+      if (left?.type === 'identifier') {
+        poisoned.add(left.text);
+        vars.delete(left.text);
+      } else if (
+        left?.type === 'field_access' &&
+        left.childForFieldName('object')?.type === 'this'
+      ) {
+        const field = left.childForFieldName('field')?.text;
+        if (field) {
+          poisoned.add(field);
+          vars.delete(field);
+        }
+      }
+    }
+    for (const child of node.namedChildren) visit(child, nextInBranch);
+  };
+
+  visit(scopeNode, false);
+
+  // For class scopes, also poison any field assigned via `this.<field> = ...` inside
+  // constructors or methods of the class so runtime-mutated fields are not folded.
+  if (scopeNode.type === 'class_declaration') {
+    const scanThisAssignments = (node: Parser.SyntaxNode): void => {
+      if (node !== scopeNode && node.type === 'class_declaration') return;
+      if (node.type === 'assignment_expression') {
+        const left = node.childForFieldName('left');
+        if (
+          left?.type === 'field_access' &&
+          left.childForFieldName('object')?.type === 'this'
+        ) {
+          const field = left.childForFieldName('field')?.text;
+          if (field) {
+            poisoned.add(field);
+            vars.delete(field);
+          }
+        }
+      }
+      for (const child of node.namedChildren) scanThisAssignments(child);
+    };
+    scanThisAssignments(scopeNode);
+  }
+
+  if (fallbackVars) {
+    for (const [k, v] of fallbackVars) {
+      if (!vars.has(k) && !poisoned.has(k)) vars.set(k, v);
+    }
+  }
+  return vars;
+}
+
 
