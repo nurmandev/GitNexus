@@ -283,7 +283,7 @@ const WEB_CLIENT_SHORT_FORM_PATTERNS = compilePatterns({
             name: (identifier) @verb (#match? @verb "^(get|post|put|delete|patch)$")
             arguments: (argument_list))
           name: (identifier) @uri_method (#eq? @uri_method "uri")
-          arguments: (argument_list . (string_literal) @path))
+          arguments: (argument_list . (_) @path))
       `,
     },
   ],
@@ -314,14 +314,14 @@ const WEB_CLIENT_LONG_FORM_PATTERNS = compilePatterns({
                 object: (identifier) @httpMethodCls (#eq? @httpMethodCls "HttpMethod")
                 field: (identifier) @verb)))
           name: (identifier) @uri_method (#eq? @uri_method "uri")
-          arguments: (argument_list . (string_literal) @path))
+          arguments: (argument_list . (_) @path))
       `,
     },
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
 // ─── Consumer: OkHttp `Request.Builder()…url("path")` ─────────────────
-// Match a bare `.url("literal")` call on ANY receiver, capturing it as `@call`.
+// Match a bare `.url(...)` call on ANY receiver, capturing it as `@call`.
 // `okHttpUrlRootsAtBuilder` (JS) then verifies the receiver chain bottoms out on
 // `new Request.Builder()` — re-imposing the framework anchor while allowing
 // builder calls BEFORE `.url()` (`new Request.Builder().addHeader(...).url("/x")`)
@@ -337,13 +337,13 @@ const OK_HTTP_PATTERNS = compilePatterns({
       query: `
         (method_invocation
           name: (identifier) @method (#eq? @method "url")
-          arguments: (argument_list . (string_literal) @path)) @call
+          arguments: (argument_list . (_) @path)) @call
       `,
     },
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
-// Match a bare `.uri(URI.create("literal"))` call on ANY receiver, capturing it
+// Match a bare `.uri(URI.create(...))` call on ANY receiver, capturing it
 // as `@call`. `httpClientUriRootsAtNewBuilder` (JS) verifies the chain includes
 // `HttpRequest.newBuilder()` — allowing calls BEFORE `.uri()` (`.version(v)`
 // `.uri(...)`) that the old object-direct query dropped, and rejecting a `.uri(...)`
@@ -365,13 +365,13 @@ const JAVA_HTTP_CLIENT_PATTERNS = compilePatterns({
             (method_invocation
               object: (identifier) @uriCls (#eq? @uriCls "URI")
               name: (identifier) @create (#eq? @create "create")
-              arguments: (argument_list . (string_literal) @path)))) @call
+              arguments: (argument_list . (_) @path)))) @call
       `,
     },
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
-// Constructor-arg form: `HttpRequest.newBuilder(URI.create("..."))` — the path is
+// Constructor-arg form: `HttpRequest.newBuilder(URI.create(...))` — the path is
 // the `newBuilder(...)` argument, with no `.uri()` call. Captures the `newBuilder`
 // call as `@call`; the emission skips it when a later `.uri(...)` overrides the
 // constructor URI (`httpClientChainHasUriCall`), so the `.uri()` query owns that case.
@@ -389,7 +389,7 @@ const JAVA_HTTP_CLIENT_CTOR_PATTERNS = compilePatterns({
             (method_invocation
               object: (identifier) @uriCls (#eq? @uriCls "URI")
               name: (identifier) @create (#eq? @create "create")
-              arguments: (argument_list . (string_literal) @path)))) @call
+              arguments: (argument_list . (_) @path)))) @call
       `,
     },
   ],
@@ -412,7 +412,7 @@ const APACHE_HTTP_CLIENT_PATTERNS = compilePatterns({
       query: `
         (object_creation_expression
           type: (type_identifier) @type (#match? @type "^Http(Get|Post|Put|Delete|Patch)$")
-          arguments: (argument_list . (string_literal) @path))
+          arguments: (argument_list . (_) @path))
       `,
     },
   ],
@@ -981,12 +981,24 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     // file's import table from the tree scan() already holds (zero extra
     // parses) and overlay it for the fold. Files whose routes are all
     // literal — the overwhelming majority — never pay this cost.
+    const effectiveFileRel = fileRel ?? '__local__.java';
     let foldConstants: RepoConstants | undefined;
     const getFoldConstants = (): RepoConstants | undefined => {
       if (foldConstants !== undefined) return foldConstants;
-      foldConstants = javaCtx?.constants;
-      if (!javaCtx?.constants || !fileRel) return foldConstants;
-      if (javaCtx.constants.has(fileRel)) return foldConstants;
+      if (!javaCtx?.constants) {
+        try {
+          const mc = extractJavaModuleConstants(tree);
+          if (mc.literals.size > 0 || mc.exprs.size > 0) {
+            foldConstants = new Map([[effectiveFileRel, mc]]);
+            return foldConstants;
+          }
+        } catch {
+          // ignore
+        }
+        return undefined;
+      }
+      foldConstants = javaCtx.constants;
+      if (!fileRel || javaCtx.constants.has(fileRel)) return foldConstants;
       try {
         const mc = extractJavaModuleConstants(tree);
         // A file carrying ONLY wildcard static imports has an empty import
@@ -1002,6 +1014,141 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
         // fold falls back to the repo-wide map (imports stay unresolved)
       }
       return foldConstants;
+    };
+
+    const getPackageName = (): string | null => {
+      for (const child of tree.rootNode.namedChildren) {
+        if (child.type === 'package_declaration') {
+          const id = child.namedChildren.find(
+            (c) => c.type === 'scoped_identifier' || c.type === 'identifier',
+          );
+          return id?.text ?? null;
+        }
+      }
+      return null;
+    };
+
+    let consumerFoldConstants: RepoConstants | undefined;
+    const getConsumerFoldConstants = (): RepoConstants | undefined => {
+      if (consumerFoldConstants !== undefined) return consumerFoldConstants;
+      const base = getFoldConstants();
+      if (!base) return undefined;
+      const pkg = getPackageName();
+      if (!pkg || !javaCtx?.constantIndex) {
+        consumerFoldConstants = base;
+        return consumerFoldConstants;
+      }
+      const prefix = `${pkg}.`;
+      const mc = base.get(effectiveFileRel);
+      const extraImports = new Map(mc?.imports ?? []);
+      let added = false;
+      for (const [mod, targetKey] of javaCtx.constantIndex.byModule) {
+        if (!targetKey || !mod.startsWith(prefix)) continue;
+        const simple = mod.slice(prefix.length);
+        if (!simple || simple.includes('.')) continue;
+        if (!extraImports.has(simple)) {
+          extraImports.set(simple, { module: mod, originalName: simple });
+          added = true;
+        }
+      }
+      if (!added) {
+        consumerFoldConstants = base;
+        return consumerFoldConstants;
+      }
+      const merged = new Map(base);
+      merged.set(effectiveFileRel, {
+        literals: mc?.literals ?? new Map(),
+        exprs: mc?.exprs ?? new Map(),
+        imports: extraImports,
+        wildcardImports: mc?.wildcardImports,
+      });
+      consumerFoldConstants = merged;
+      return consumerFoldConstants;
+    };
+
+    const resolveConstOrConcat = (
+      pathNode: Parser.SyntaxNode,
+      allowStaticBuilder = false,
+    ): string | null => {
+      if (pathNode.type === 'string_literal') return unquoteLiteral(pathNode.text);
+      if (allowStaticBuilder) {
+        const staticPath = extractStaticPathExpression(pathNode);
+        if (staticPath !== null) return staticPath;
+        // Unwrap `URI.create(expr)` when the inner argument is a constant or concat expression.
+        if (
+          pathNode.type === 'method_invocation' &&
+          pathNode.childForFieldName('object')?.text === 'URI' &&
+          pathNode.childForFieldName('name')?.text === 'create'
+        ) {
+          const inner = pathNode.childForFieldName('arguments')?.namedChildren[0];
+          if (inner) return resolveConstOrConcat(inner, false);
+        }
+      }
+      const constants = getConsumerFoldConstants();
+      if (constants) {
+        const operands = parseJavaConstOperands(pathNode);
+        if (operands !== null) {
+          const folded = foldJavaOperands(effectiveFileRel, operands, constants);
+          if (folded !== null) return folded;
+        }
+      }
+      if (pathNode.type !== 'binary_expression') return null;
+      const parts: Array<{ literal: string } | { dynamic: true }> = [];
+      const flattenPlus = (node: Parser.SyntaxNode): boolean => {
+        if (node.type === 'binary_expression') {
+          if (!node.children.some((c) => c.type === '+')) return false;
+          const left = node.childForFieldName('left');
+          const right = node.childForFieldName('right');
+          return left != null && right != null && flattenPlus(left) && flattenPlus(right);
+        }
+        if (node.type === 'string_literal') {
+          const v = unquoteLiteral(node.text);
+          if (v === null) return false;
+          parts.push({ literal: v });
+          return true;
+        }
+        if (node.type === 'decimal_integer_literal' || node.type === 'hex_integer_literal') {
+          parts.push({ literal: node.text });
+          return true;
+        }
+        if (node.type === 'identifier' || node.type === 'field_access') {
+          if (constants) {
+            const ops = parseJavaConstOperands(node);
+            if (ops !== null) {
+              const folded = foldJavaOperands(effectiveFileRel, ops, constants);
+              if (folded !== null) {
+                parts.push({ literal: folded });
+                return true;
+              }
+            }
+          }
+          if (node.type === 'identifier') {
+            parts.push({ dynamic: true });
+            return true;
+          }
+        }
+        return false;
+      };
+      if (!flattenPlus(pathNode)) return null;
+      const hasStaticSlash = parts.some((p) => 'literal' in p && p.literal.includes('/'));
+      if (!hasStaticSlash) return null;
+      let built = '';
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        if ('literal' in part) {
+          built += part.literal;
+        } else {
+          const next = parts[i + 1];
+          const prevEndsWithSlash = built.endsWith('/');
+          const inQuery = built.includes('?');
+          const nextStartsWithSlash = next && 'literal' in next && next.literal.startsWith('/');
+          if (!prevEndsWithSlash && !inQuery && !(i === 0 && nextStartsWithSlash)) {
+            return null;
+          }
+          built += '${param}';
+        }
+      }
+      return built || null;
     };
 
     for (const route of methodRoutes) {
@@ -1122,7 +1269,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isRestTemplateReceiver(objNode, receivers)) continue;
       const httpMethod = REST_TEMPLATE_TO_HTTP[methodNode.text];
       if (!httpMethod) continue;
-      const path = extractStaticPathExpression(pathNode);
+      const path = resolveConstOrConcat(pathNode, true);
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1141,7 +1288,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!httpMethodNode || !pathNode) continue;
       if (!isRestTemplateReceiver(objNode, receivers)) continue;
-      const path = extractStaticPathExpression(pathNode);
+      const path = resolveConstOrConcat(pathNode, true);
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1165,7 +1312,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isWebClientReceiver(objNode, receivers)) continue;
       const httpMethod = WEB_CLIENT_SHORT_TO_HTTP[verbNode.text];
       if (!httpMethod) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1191,7 +1338,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!isWebClientReceiver(objNode, receivers)) continue;
       const verbText = verbNode.text;
       if (!WEB_CLIENT_LONG_VERB_RE.test(verbText)) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       out.push({
         role: 'consumer',
@@ -1205,7 +1352,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     }
 
     // ─── Consumers: OkHttp Request.Builder().url("path") ────────────
-    // Match any `.url("literal")`, gate to chains rooting at `new Request.Builder()`
+    // Match any `.url(...)`, gate to chains rooting at `new Request.Builder()`
     // (so a call before `.url()` is captured but an unrelated `.url()` is not), then
     // recover the verb (`.post()`/`.method("X")`) by scanning the builder chain.
     for (const match of runCompiledPatterns(OK_HTTP_PATTERNS, tree)) {
@@ -1213,7 +1360,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
       if (!okHttpUrlRootsAtBuilder(callNode)) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       const method = inferOkHttpMethod(callNode);
       // An explicit `.method(verb, …)` with a non-literal or empty verb is
@@ -1232,7 +1379,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     }
 
     // ─── Consumers: Java HttpClient request builder ─────────────────
-    // Match any `.uri(URI.create("..."))`, gate to chains including `HttpRequest`
+    // Match any `.uri(URI.create(...))`, gate to chains including `HttpRequest`
     // `.newBuilder()` (so a call before `.uri()` is captured but an unrelated
     // `.uri()` is not); `inferHttpClientMethod` scans the chain for the verb — a
     // `.GET()/.POST()/.PUT()/.DELETE()/.HEAD()` helper, a `.method("VERB", body)`
@@ -1244,7 +1391,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
       if (!httpClientUriRootsAtNewBuilder(callNode)) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       const method = inferHttpClientMethod(callNode);
       if (!method) continue;
@@ -1259,7 +1406,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       });
     }
 
-    // Constructor-arg form: `HttpRequest.newBuilder(URI.create("..."))` with the
+    // Constructor-arg form: `HttpRequest.newBuilder(URI.create(...))` with the
     // path in the constructor and no overriding `.uri(...)` later in the chain
     // (a later `.uri()` wins at runtime, so the loop above owns that case).
     for (const match of runCompiledPatterns(JAVA_HTTP_CLIENT_CTOR_PATTERNS, tree)) {
@@ -1267,7 +1414,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       const pathNode = match.captures.path;
       if (!callNode || !pathNode) continue;
       if (httpClientChainHasUriCall(callNode)) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       const method = inferHttpClientMethod(callNode);
       if (!method) continue;
@@ -1289,7 +1436,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       if (!typeNode || !pathNode) continue;
       const httpMethod = APACHE_HTTP_CLIENT_TO_HTTP[typeNode.text];
       if (!httpMethod) continue;
-      const path = unquoteLiteral(pathNode.text);
+      const path = resolveConstOrConcat(pathNode);
       if (path === null) continue;
       out.push({
         role: 'consumer',
