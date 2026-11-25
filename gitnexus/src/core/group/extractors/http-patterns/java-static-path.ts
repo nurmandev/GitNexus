@@ -267,3 +267,156 @@ export function httpClientChainHasUriCall(newBuilderCall: Parser.SyntaxNode): bo
     (call) => call.id !== newBuilderCall.id && methodInvocationName(call) === 'uri',
   );
 }
+
+// ─── Type-aware HTTP client receiver resolution (#1870) ──────────────────
+
+export interface JavaHttpClientReceivers {
+  restTemplateNames: Set<string>;
+  webClientNames: Set<string>;
+}
+
+function simpleTypeName(typeNode: Parser.SyntaxNode | null | undefined): string | null {
+  if (!typeNode) return null;
+  if (typeNode.type === 'type_identifier') return typeNode.text;
+  if (typeNode.type === 'scoped_type_identifier') {
+    return typeNode.text.split('.').pop() ?? null;
+  }
+  return null;
+}
+
+function unwrapParens(node: Parser.SyntaxNode | null | undefined): Parser.SyntaxNode | null {
+  let cur = node ?? null;
+  while (cur?.type === 'parenthesized_expression') {
+    cur = cur.namedChildren[0] ?? null;
+  }
+  return cur;
+}
+
+function isRestTemplateCreation(node: Parser.SyntaxNode | null | undefined): boolean {
+  const expr = unwrapParens(node);
+  if (!expr) return false;
+  if (expr.type === 'object_creation_expression') {
+    return simpleTypeName(expr.childForFieldName('type')) === 'RestTemplate';
+  }
+  if (expr.type === 'method_invocation') {
+    // e.g. new RestTemplateBuilder()...build()
+    if (methodInvocationName(expr) !== 'build') return false;
+    let obj = methodInvocationObject(expr);
+    while (obj?.type === 'method_invocation') obj = methodInvocationObject(obj);
+    return (
+      obj?.type === 'object_creation_expression' &&
+      simpleTypeName(obj.childForFieldName('type')) === 'RestTemplateBuilder'
+    );
+  }
+  return false;
+}
+
+function isWebClientCreation(node: Parser.SyntaxNode | null | undefined): boolean {
+  const expr = unwrapParens(node);
+  if (expr?.type !== 'method_invocation') return false;
+  const name = methodInvocationName(expr);
+  const obj = methodInvocationObject(expr);
+  if (name === 'create' && obj?.text === 'WebClient') return true;
+  if (name === 'build') {
+    let cur = obj;
+    while (cur?.type === 'method_invocation') {
+      if (methodInvocationName(cur) === 'builder' && methodInvocationObject(cur)?.text === 'WebClient') {
+        return true;
+      }
+      cur = methodInvocationObject(cur);
+    }
+  }
+  return false;
+}
+
+function collectDeclarators(
+  declNode: Parser.SyntaxNode,
+  out: Array<{ name: string; value: Parser.SyntaxNode | null }>,
+): void {
+  for (const child of declNode.namedChildren) {
+    if (child.type === 'variable_declarator') {
+      const name = child.childForFieldName('name')?.text;
+      if (name) out.push({ name, value: child.childForFieldName('value') });
+    }
+  }
+}
+
+/**
+ * Collect variable, field, and parameter names declared as `RestTemplate` or
+ * `WebClient` (including `var` locals initialized from `new RestTemplate()` /
+ * `WebClient.create()` / `WebClient.builder()...build()`). Preserves `restTemplate`
+ * / `webClient` as fallback names when not explicitly shadowed by an unrelated type.
+ */
+export function collectJavaHttpClientReceivers(tree: Parser.Tree): JavaHttpClientReceivers {
+  const restTemplateNames = new Set<string>();
+  const webClientNames = new Set<string>();
+  const nonClientNames = new Set<string>();
+
+  const visit = (node: Parser.SyntaxNode): void => {
+    if (node.type === 'field_declaration' || node.type === 'local_variable_declaration') {
+      const typeName = simpleTypeName(node.childForFieldName('type'));
+      const declarators: Array<{ name: string; value: Parser.SyntaxNode | null }> = [];
+      collectDeclarators(node, declarators);
+      for (const { name, value } of declarators) {
+        if (typeName === 'RestTemplate') {
+          restTemplateNames.add(name);
+        } else if (typeName === 'WebClient') {
+          webClientNames.add(name);
+        } else if (typeName === 'var') {
+          if (isRestTemplateCreation(value)) restTemplateNames.add(name);
+          else if (isWebClientCreation(value)) webClientNames.add(name);
+          else nonClientNames.add(name);
+        } else if (typeName !== null) {
+          nonClientNames.add(name);
+        }
+      }
+    } else if (node.type === 'formal_parameter') {
+      const typeName = simpleTypeName(node.childForFieldName('type'));
+      const name = node.childForFieldName('name')?.text;
+      if (name) {
+        if (typeName === 'RestTemplate') restTemplateNames.add(name);
+        else if (typeName === 'WebClient') webClientNames.add(name);
+        else if (typeName !== null) nonClientNames.add(name);
+      }
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+
+  visit(tree.rootNode);
+
+  if (!nonClientNames.has('restTemplate')) restTemplateNames.add('restTemplate');
+  if (!nonClientNames.has('webClient')) webClientNames.add('webClient');
+
+  return { restTemplateNames, webClientNames };
+}
+
+export function isRestTemplateReceiver(
+  objNode: Parser.SyntaxNode | undefined,
+  receivers: JavaHttpClientReceivers,
+): boolean {
+  const expr = unwrapParens(objNode);
+  if (!expr) return false;
+  if (expr.type === 'identifier') return receivers.restTemplateNames.has(expr.text);
+  if (expr.type === 'field_access') {
+    const obj = expr.childForFieldName('object');
+    const field = expr.childForFieldName('field');
+    if (obj?.type === 'this' && field) return receivers.restTemplateNames.has(field.text);
+  }
+  return isRestTemplateCreation(expr);
+}
+
+export function isWebClientReceiver(
+  objNode: Parser.SyntaxNode | undefined,
+  receivers: JavaHttpClientReceivers,
+): boolean {
+  const expr = unwrapParens(objNode);
+  if (!expr) return false;
+  if (expr.type === 'identifier') return receivers.webClientNames.has(expr.text);
+  if (expr.type === 'field_access') {
+    const obj = expr.childForFieldName('object');
+    const field = expr.childForFieldName('field');
+    if (obj?.type === 'this' && field) return receivers.webClientNames.has(field.text);
+  }
+  return isWebClientCreation(expr);
+}
+

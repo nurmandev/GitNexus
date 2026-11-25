@@ -47,6 +47,9 @@ import {
   okHttpUrlRootsAtBuilder,
   httpClientUriRootsAtNewBuilder,
   httpClientChainHasUriCall,
+  collectJavaHttpClientReceivers,
+  isRestTemplateReceiver,
+  isWebClientReceiver,
 } from './java-static-path.js';
 import type { HttpDetection, HttpLanguagePlugin, HttpProjectScan } from './types.js';
 
@@ -239,7 +242,7 @@ const REST_TEMPLATE_PATTERNS = compilePatterns({
       meta: { framework: 'spring-rest-template' },
       query: `
         (method_invocation
-          object: (identifier) @obj (#eq? @obj "restTemplate")
+          object: (_) @obj
           name: (identifier) @method
           arguments: (argument_list . (_) @path))
       `,
@@ -255,7 +258,7 @@ const REST_TEMPLATE_EXCHANGE_PATTERNS = compilePatterns({
       meta: { framework: 'spring-rest-template' },
       query: `
         (method_invocation
-          object: (identifier) @obj (#eq? @obj "restTemplate")
+          object: (_) @obj
           name: (identifier) @method (#eq? @method "exchange")
           arguments: (argument_list
             . (_) @path
@@ -276,7 +279,7 @@ const WEB_CLIENT_SHORT_FORM_PATTERNS = compilePatterns({
       query: `
         (method_invocation
           object: (method_invocation
-            object: (identifier) @obj (#eq? @obj "webClient")
+            object: (_) @obj
             name: (identifier) @verb (#match? @verb "^(get|post|put|delete|patch)$")
             arguments: (argument_list))
           name: (identifier) @uri_method (#eq? @uri_method "uri")
@@ -304,7 +307,7 @@ const WEB_CLIENT_LONG_FORM_PATTERNS = compilePatterns({
       query: `
         (method_invocation
           object: (method_invocation
-            object: (identifier) @obj (#eq? @obj "webClient")
+            object: (_) @obj
             name: (identifier) @method_call (#eq? @method_call "method")
             arguments: (argument_list
               (field_access
@@ -873,7 +876,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
   // any of these must still be parsed so its consumer contracts are not dropped
   // (ingestion emits no FETCHES for Java). Conservative by design.
   hasConsumerSignals(content) {
-    return /\brestTemplate\b|\bwebClient\b|Request\.Builder|HttpRequest|HttpMethod\.|new\s+Http(Get|Post|Put|Delete|Patch)\b|@RequestLine|@FeignClient|Exchange/.test(
+    return /\brestTemplate\b|\bRestTemplate\b|\bwebClient\b|\bWebClient\b|Request\.Builder|HttpRequest|HttpMethod\.|new\s+Http(Get|Post|Put|Delete|Patch)\b|@RequestLine|@FeignClient|Exchange/.test(
       content,
     );
   },
@@ -1108,11 +1111,15 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       }
     }
 
-    // ─── Consumers: RestTemplate ────────────────────────────────────
+    // ─── Consumers: RestTemplate & WebClient (type-aware receivers) ─
+    const receivers = collectJavaHttpClientReceivers(tree);
+
     for (const match of runCompiledPatterns(REST_TEMPLATE_PATTERNS, tree)) {
+      const objNode = match.captures.obj;
       const methodNode = match.captures.method;
       const pathNode = match.captures.path;
       if (!methodNode || !pathNode) continue;
+      if (!isRestTemplateReceiver(objNode, receivers)) continue;
       const httpMethod = REST_TEMPLATE_TO_HTTP[methodNode.text];
       if (!httpMethod) continue;
       const path = extractStaticPathExpression(pathNode);
@@ -1129,9 +1136,11 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     }
 
     for (const match of runCompiledPatterns(REST_TEMPLATE_EXCHANGE_PATTERNS, tree)) {
+      const objNode = match.captures.obj;
       const httpMethodNode = match.captures.http_method;
       const pathNode = match.captures.path;
       if (!httpMethodNode || !pathNode) continue;
+      if (!isRestTemplateReceiver(objNode, receivers)) continue;
       const path = extractStaticPathExpression(pathNode);
       if (path === null) continue;
       out.push({
@@ -1145,14 +1154,15 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
       });
     }
 
-    // ─── Consumers: WebClient.get().uri("path") short form ─────────
-    // Source-scan only: receiver must be named exactly `webClient`. The
-    // long-form chain `webClient.method(HttpMethod.X).uri("/x")` is handled
+    // ─── Consumers: WebClient.<verb>().uri("path") short form ────────
+    // The long-form chain `wc.method(HttpMethod.X).uri("/x")` is handled
     // separately below by WEB_CLIENT_LONG_FORM_PATTERNS.
     for (const match of runCompiledPatterns(WEB_CLIENT_SHORT_FORM_PATTERNS, tree)) {
+      const objNode = match.captures.obj;
       const verbNode = match.captures.verb;
       const pathNode = match.captures.path;
       if (!verbNode || !pathNode) continue;
+      if (!isWebClientReceiver(objNode, receivers)) continue;
       const httpMethod = WEB_CLIENT_SHORT_TO_HTTP[verbNode.text];
       if (!httpMethod) continue;
       const path = unquoteLiteral(pathNode.text);
@@ -1174,9 +1184,11 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     // form). The short-form query requires an empty inner argument list, so it
     // cannot also fire on this chain — no double-emit.
     for (const match of runCompiledPatterns(WEB_CLIENT_LONG_FORM_PATTERNS, tree)) {
+      const objNode = match.captures.obj;
       const verbNode = match.captures.verb;
       const pathNode = match.captures.path;
       if (!verbNode || !pathNode) continue;
+      if (!isWebClientReceiver(objNode, receivers)) continue;
       const verbText = verbNode.text;
       if (!WEB_CLIENT_LONG_VERB_RE.test(verbText)) continue;
       const path = unquoteLiteral(pathNode.text);
