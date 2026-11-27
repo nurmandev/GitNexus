@@ -49,7 +49,7 @@ import {
   okHttpUrlRootsAtBuilder,
   httpClientUriRootsAtNewBuilder,
   httpClientChainHasUriCall,
-  collectJavaHttpClientReceivers,
+  collectHttpClientReceivers,
   isRestTemplateReceiver,
   isWebClientReceiver,
   resolveWebClientReceiverBaseUrl,
@@ -1322,7 +1322,7 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     // ─── Consumers: RestTemplate & WebClient (type-aware receivers) ─
     const resolveBaseUrlArg = (arg: Parser.SyntaxNode): string | null =>
       resolveConstOrConcat(arg, { allowStaticBuilder: true });
-    const receivers = collectJavaHttpClientReceivers(tree, resolveBaseUrlArg);
+    const receivers = collectHttpClientReceivers(tree, resolveBaseUrlArg);
 
     for (const match of runCompiledPatterns(REST_TEMPLATE_PATTERNS, tree)) {
       const objNode = match.captures.obj;

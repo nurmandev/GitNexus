@@ -423,7 +423,7 @@ export function httpClientChainHasUriCall(newBuilderCall: Parser.SyntaxNode): bo
 
 // ─── Type-aware HTTP client receiver resolution (#1870) ──────────────────
 
-export interface JavaHttpClientReceivers {
+export interface HttpClientReceivers {
   restTemplateNames: Set<string>;
   webClientNames: Set<string>;
   okHttpBuilderNames: Set<string>;
@@ -562,10 +562,10 @@ function collectDeclarators(
  * `WebClient`, or `Request.Builder`, plus statically resolvable `WebClient`
  * base URLs.
  */
-export function collectJavaHttpClientReceivers(
+export function collectHttpClientReceivers(
   tree: Parser.Tree,
   resolveBaseUrlArg?: JavaArgResolver,
-): JavaHttpClientReceivers {
+): HttpClientReceivers {
   const restTemplateNames = new Set<string>();
   const webClientNames = new Set<string>();
   const okHttpBuilderNames = new Set<string>();
@@ -668,7 +668,7 @@ export function collectJavaHttpClientReceivers(
 
 export function isRestTemplateReceiver(
   objNode: Parser.SyntaxNode | undefined,
-  receivers: JavaHttpClientReceivers,
+  receivers: HttpClientReceivers,
 ): boolean {
   const expr = unwrapParens(objNode);
   if (!expr) return false;
@@ -683,7 +683,7 @@ export function isRestTemplateReceiver(
 
 export function isWebClientReceiver(
   objNode: Parser.SyntaxNode | undefined,
-  receivers: JavaHttpClientReceivers,
+  receivers: HttpClientReceivers,
 ): boolean {
   const expr = unwrapParens(objNode);
   if (!expr) return false;
@@ -698,7 +698,7 @@ export function isWebClientReceiver(
 
 export function resolveWebClientReceiverBaseUrl(
   objNode: Parser.SyntaxNode | undefined,
-  receivers: JavaHttpClientReceivers,
+  receivers: HttpClientReceivers,
   resolveBaseUrlArg?: JavaArgResolver,
 ): string | null {
   const expr = unwrapParens(objNode);
